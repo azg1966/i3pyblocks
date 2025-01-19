@@ -11,6 +11,7 @@ To inspect and debug a D-Bus protocol, `DFeet`_ can help.
 """
 
 import asyncio
+from turtle import onclick
 from typing import Any, Callable, Dict, List, Optional
 
 from dbus_next import Variant
@@ -237,6 +238,7 @@ class MediaPlayerBlock(DbusBlock):
     bus_name = "org.mpris.MediaPlayer2.{player}"
     object_path = "/org/mpris/MediaPlayer2"
     interface_name = "org.freedesktop.DBus.Properties"
+    player_interface_name = "org.mpris.MediaPlayer2.Player"
 
     def __init__(
         self,
@@ -261,6 +263,7 @@ class MediaPlayerBlock(DbusBlock):
             "track_number": "",
         }
         self.playing = False
+        self.player_interface: dbus_aio.ProxyInterface | None = None
 
     def update_properties(
         self,
@@ -294,5 +297,72 @@ class MediaPlayerBlock(DbusBlock):
         try:
             await self.wait_interface()
             self.safe_signal_call("properties_changed", self.update_callback)
+            # await self.update_player_state()
+            await self.run()
         except Exception as e:
             self.exception(e)
+
+    async def wait_player_interface(self):
+        while not self.player_interface:
+            try:
+                self.player_interface = await self.get_interface_via_introspection(
+                    self.bus_name,
+                    self.object_path,
+                    self.player_interface_name,
+                )
+            except errors.DBusError:
+                logger.debug(
+                    f"D-Bus {self.bus_name} {self.player_interface_name} service not found, retrying..."
+                )
+                await asyncio.sleep(self.dbus_conn_sleep)
+
+    async def run(self):
+        while True:
+            if not self.player_interface:
+                await self.wait_player_interface()
+                if metadata := await self.get_metadata():
+                    self.update_callback("", {"Metadata": metadata}, [])
+            try:
+                props = {}
+                if playback_status := await self.get_playback_status():
+                    self.update_callback("", {"PlaybackStatus": playback_status}, [])
+            except errors.DBusError:
+                self.player_interface = None
+                self.update("")
+            await asyncio.sleep(1)
+
+    async def get_playback_status(self):
+        pb_status = await self.player_interface.get_playback_status()
+        if not self.playing and pb_status != "Playing":
+            return
+        return Variant("s", pb_status)
+
+    async def get_metadata(self):
+        try:
+            return Variant("a{sv}", await self.player_interface.get_metadata())
+        except errors.DBusError:
+            logger.debug("Cannot load metadata")
+
+    async def click_handler(
+        self,
+        *,
+        x: int,
+        y: int,
+        button: int,
+        relative_x: int,
+        relative_y: int,
+        width: int,
+        height: int,
+        modifiers: List[str | None],
+    ) -> None:
+            if not self.player_interface:
+                return
+            match button:
+                case types.MouseButton.LEFT_BUTTON:
+                    await self.player_interface.call_play_pause()
+                case types.MouseButton.RIGHT_BUTTON:
+                    await self.player_interface.call_next()
+                case types.MouseButton.MIDDLE_BUTTON:
+                    await self.player_interface.call_prev()
+                
+                    
